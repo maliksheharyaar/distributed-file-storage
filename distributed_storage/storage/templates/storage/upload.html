@@ -1,0 +1,318 @@
+{% extends 'storage/base.html' %}
+
+{% block extra_css %}
+<style>
+    .progress-bar { 
+        transition: width 0.3s ease-in-out;
+        background-image: linear-gradient(45deg, rgba(255,255,255,.15) 25%, transparent 25%, transparent 50%, rgba(255,255,255,.15) 50%, rgba(255,255,255,.15) 75%, transparent 75%, transparent);
+        background-size: 1rem 1rem;
+        animation: progress-bar-stripes 1s linear infinite;
+    }
+    @keyframes progress-bar-stripes {
+        0% { background-position: 1rem 0; }
+        100% { background-position: 0 0; }
+    }
+    .file-info { font-size: 0.875rem; color: #666; }
+    .alert {
+        padding: 1rem;
+        margin-bottom: 1rem;
+        border-radius: 0.375rem;
+        display: none;
+    }
+    .alert-info {
+        background-color: #e0f2fe;
+        color: #0369a1;
+        border: 1px solid #7dd3fc;
+    }
+    .alert-warning {
+        background-color: #fef3c7;
+        color: #92400e;
+        border: 1px solid #fcd34d;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<!-- Upload Section -->
+<div class="bg-white rounded shadow p-6 mb-6">
+    <h2 class="text-xl font-bold mb-4">Upload Files</h2>
+    <p class="text-sm text-gray-600 mb-4">
+        Files will be split into {{ chunk_size|filesizeformat }} chunks with {{ replication_factor }}x replication
+    </p>
+    
+    <div id="uploadAlert" class="alert"></div>
+    
+    <form id="uploadForm" class="space-y-4">
+        <input type="file" id="fileInput" multiple class="block w-full">
+        <div id="uploadProgress" class="hidden">
+            <div class="flex justify-between text-sm text-gray-600 mb-1">
+                <span>Uploading: <span id="fileName"></span></span>
+                <span id="uploadPercent">0%</span>
+            </div>
+            <div class="bg-gray-200 rounded-full h-2.5">
+                <div id="progressBar" class="progress-bar bg-blue-600 h-2.5 rounded-full" style="width: 0%"></div>
+            </div>
+        </div>
+        <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">
+            Upload Files
+        </button>
+    </form>
+</div>
+
+<!-- Files List -->
+<div class="bg-white rounded shadow p-6">
+    <div class="flex justify-between items-center mb-4">
+        <h2 class="text-xl font-bold">Your Files</h2>
+        <input type="text" id="searchInput" placeholder="Search files..." 
+               class="border rounded px-3 py-1">
+    </div>
+
+    <div class="overflow-x-auto">
+        <table class="w-full">
+            <thead class="bg-gray-50">
+                <tr>
+                    <th class="text-left p-3">Name</th>
+                    <th class="text-left p-3">Size</th>
+                    <th class="text-left p-3">Distribution</th>
+                    <th class="text-left p-3">Actions</th>
+                </tr>
+            </thead>
+            <tbody id="fileList">
+                {% if initial_files %}
+                    {% for file in initial_files %}
+                    <tr class="border-t">
+                        <td class="p-3">
+                            {{ file.name }}
+                            <div class="file-info">Modified: {{ file.modified }}</div>
+                        </td>
+                        <td class="p-3">{{ file.size }}</td>
+                        <td class="p-3">
+                            <div>{{ file.chunks.count }} chunks ({{ file.chunks.size }} each)</div>
+                            <div class="file-info">{{ file.chunks.replicas }}x replication</div>
+                        </td>
+                        <td class="p-3">
+                            <a href="{{ file.url }}" class="text-blue-600 hover:underline mr-3">Download</a>
+                            <button onclick="deleteFile('{{ file.name }}')" 
+                                    class="text-red-600 hover:underline">Delete</button>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                {% else %}
+                    <tr>
+                        <td colspan="4" class="text-center p-4">No files found</td>
+                    </tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- System Stats -->
+<div class="mt-6 grid grid-cols-1 md:grid-cols-4 gap-4">
+    <div class="bg-white p-4 rounded shadow">
+        <h3 class="font-bold text-gray-700">Total Files</h3>
+        <p id="totalFiles" class="text-2xl">{{ stats.total_files }}</p>
+    </div>
+    <div class="bg-white p-4 rounded shadow">
+        <h3 class="font-bold text-gray-700">Storage Used</h3>
+        <p id="storageUsed" class="text-2xl">{{ stats.storage_used }}</p>
+    </div>
+    <div class="bg-white p-4 rounded shadow">
+        <h3 class="font-bold text-gray-700">Active Nodes</h3>
+        <p id="activeNodes" class="text-2xl">{{ stats.active_nodes }}</p>
+    </div>
+    <div class="bg-white p-4 rounded shadow">
+        <h3 class="font-bold text-gray-700">Total Chunks</h3>
+        <p id="totalChunks" class="text-2xl">0</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    // System configuration
+    const CONFIG = {
+        endpoints: {{ endpoints|safe }},
+        chunk_size: {{ chunk_size }},
+        replication_factor: {{ replication_factor }}
+    };
+
+    // File list handling
+    function updateFileList(files) {
+        const fileList = document.getElementById('fileList');
+        if (!files.length) {
+            fileList.innerHTML = '<tr><td colspan="4" class="text-center p-4">No files found</td></tr>';
+            return;
+        }
+
+        fileList.innerHTML = files.map(file => `
+            <tr class="border-t">
+                <td class="p-3">
+                    ${file.name}
+                    <div class="file-info">Modified: ${file.modified}</div>
+                </td>
+                <td class="p-3">${file.size}</td>
+                <td class="p-3">
+                    <div>${file.chunks.count} chunks (${file.chunks.size} each)</div>
+                    <div class="file-info">${file.chunks.replicas}x replication</div>
+                </td>
+                <td class="p-3">
+                    <a href="${file.url}" class="text-blue-600 hover:underline mr-3">Download</a>
+                    <button onclick="deleteFile('${file.name}')" 
+                            class="text-red-600 hover:underline">Delete</button>
+                </td>
+            </tr>
+        `).join('');
+    }
+
+    // Show alert message
+    function showAlert(message, type = 'info') {
+        const alert = document.getElementById('uploadAlert');
+        alert.textContent = message;
+        alert.className = `alert alert-${type}`;
+        alert.style.display = 'block';
+        setTimeout(() => {
+            alert.style.display = 'none';
+        }, 5000);
+    }
+
+    // Update progress bar
+    function updateProgress(percent) {
+        const progressBar = document.getElementById('progressBar');
+        const percentText = document.getElementById('uploadPercent');
+        progressBar.style.width = `${percent}%`;
+        percentText.textContent = `${percent}%`;
+    }
+
+    // File upload handling
+    document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const files = document.getElementById('fileInput').files;
+        if (!files.length) return;
+
+        const progress = document.getElementById('uploadProgress');
+        const fileName = document.getElementById('fileName');
+        const submitButton = e.target.querySelector('button[type="submit"]');
+
+        for (const file of files) {
+            const formData = new FormData();
+            formData.append('file', file);
+
+            progress.classList.remove('hidden');
+            fileName.textContent = file.name;
+            submitButton.disabled = true;
+            
+            // Start progress animation
+            let progressPercent = 0;
+            const progressInterval = setInterval(() => {
+                if (progressPercent < 90) {
+                    progressPercent += 5;
+                    updateProgress(progressPercent);
+                }
+            }, 300);
+
+            try {
+                const response = await fetch(CONFIG.endpoints.upload, {
+                    method: 'POST',
+                    headers: {
+                        'X-CSRFToken': getCsrf()
+                    },
+                    body: formData
+                });
+
+                clearInterval(progressInterval);
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    updateProgress(100);
+                    if (data.message === 'File exists') {
+                        showAlert(`File "${file.name}" already exists in the system.`, 'warning');
+                    } else {
+                        showAlert(`File "${file.name}" uploaded successfully!`, 'info');
+                    }
+                    loadFiles();
+                } else {
+                    throw new Error(data.error || 'Upload failed');
+                }
+            } catch (error) {
+                clearInterval(progressInterval);
+                updateProgress(0);
+                showAlert(`Upload failed: ${error.message}`, 'warning');
+            }
+        }
+
+        progress.classList.add('hidden');
+        submitButton.disabled = false;
+        e.target.reset();
+    });
+
+    // File operations
+    async function deleteFile(name) {
+        if (!confirm('Delete this file?')) return;
+
+        try {
+            const response = await fetch(CONFIG.endpoints.delete_base.replace('FILENAME', name), {
+                method: 'DELETE',
+                headers: {
+                    'X-CSRFToken': getCsrf()
+                }
+            });
+
+            if (!response.ok) throw new Error('Delete failed');
+            
+            loadFiles();
+        } catch (error) {
+            alert('Delete failed: ' + error.message);
+        }
+    }
+
+    // Search functionality
+    document.getElementById('searchInput').addEventListener('input', (e) => {
+        const term = e.target.value.toLowerCase();
+        const filtered = window.fileData.filter(f => 
+            f.name.toLowerCase().includes(term)
+        );
+        updateFileList(filtered);
+    });
+
+    // Load files and stats
+    async function loadFiles() {
+        try {
+            const [filesResp, statsResp] = await Promise.all([
+                fetch(CONFIG.endpoints.files),
+                fetch(CONFIG.endpoints.stats)
+            ]);
+
+            const [filesData, statsData] = await Promise.all([
+                filesResp.json(),
+                statsResp.json()
+            ]);
+
+            window.fileData = filesData.files || [];
+            updateFileList(window.fileData);
+
+            // Update stats
+            document.getElementById('totalFiles').textContent = statsData.total_files || 0;
+            document.getElementById('storageUsed').textContent = statsData.total_storage || '0 B';
+            document.getElementById('activeNodes').textContent = 
+                statsData.nodes?.filter(n => n.status === 'active').length || 0;
+            document.getElementById('totalChunks').textContent = statsData.total_chunks || 0;
+
+        } catch (error) {
+            console.error('Error loading data:', error);
+        }
+    }
+
+    // CSRF token handling
+    function getCsrf() {
+        return document.cookie.split(';')
+            .find(c => c.trim().startsWith('csrftoken='))
+            ?.split('=')[1] || '';
+    }
+
+    // Initial load and refresh
+    loadFiles();
+    setInterval(loadFiles, 60000);
+</script>
+{% endblock %}
