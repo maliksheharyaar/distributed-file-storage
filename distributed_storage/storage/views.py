@@ -120,7 +120,7 @@ def get_least_loaded_nodes(count=REPLICATION_FACTOR):
     return node_ids[:count]
 
 # Create chunks of the file
-def create_chunks(file_content, chunk_size=CHUNK_SIZE):
+def create_chunks(file_content, filename, chunk_size=CHUNK_SIZE):
     total_chunks = math.ceil(len(file_content) / chunk_size)
     chunks = []
     
@@ -129,7 +129,8 @@ def create_chunks(file_content, chunk_size=CHUNK_SIZE):
         end = start + chunk_size
         chunk = file_content[start:end]
         chunk_hash = hashlib.sha256(chunk).hexdigest()
-        chunks.append((chunk, chunk_hash))
+        chunk_name = f"{filename}.part{i+1}"  # Using 1-based indexing for parts
+        chunks.append((chunk, chunk_hash, chunk_name))
     
     return chunks
 
@@ -157,7 +158,9 @@ def save_file(request):
             'url': existing_file.file_url
         })
 
-    chunks = create_chunks(content)
+    # Get base filename without path
+    filename = uploaded_file.name.split('/')[-1]
+    chunks = create_chunks(content, filename)
     target_nodes = get_least_loaded_nodes()
     
     try:
@@ -173,26 +176,24 @@ def save_file(request):
         # Upload complete file using the content we already read
         primary_client.put_object(
             Bucket=bucket_name,
-            Key=uploaded_file.name,
+            Key=filename,
             Body=content
         )
         
         # Generate the correct URL for file access
-        file_url = f"{settings.STORAGE_NODES[primary_node]['endpoint_url']}/{bucket_name}/{uploaded_file.name}"
+        file_url = f"{settings.STORAGE_NODES[primary_node]['endpoint_url']}/{bucket_name}/{filename}"
         
         # Store file metadata
         file_metadata = FileMetadata.objects.create(
-            filename=uploaded_file.name,
-            file_size=len(content),  # Use the actual content length
+            filename=filename,
+            file_size=len(content),
             file_hash=file_hash,
             chunk_count=len(chunks),
             file_url=file_url
         )
 
         # Store chunks with replication
-        for idx, (chunk_data, chunk_hash) in enumerate(chunks):
-            chunk_name = f"{file_hash}_chunk_{idx}"
-            
+        for idx, (chunk_data, chunk_hash, chunk_name) in enumerate(chunks):
             # Store chunk on multiple nodes using put_object instead of upload_fileobj
             for node_id in target_nodes:
                 storage_nodes[node_id].put_object(
@@ -204,7 +205,7 @@ def save_file(request):
                 # Store chunk metadata
                 ChunkMetadata.objects.create(
                     file=file_metadata,
-                    chunk_index=idx,
+                    chunk_index=idx + 1,  # Using 1-based indexing
                     chunk_hash=chunk_hash,
                     node_id=node_id,
                     chunk_size=len(chunk_data)
@@ -256,11 +257,11 @@ def get_download_url(request, file_name):
         # Verify file integrity
         for chunk in chunks:
             node_id = chunk.node_id
-            chunk_name = f"{file_metadata.file_hash}_chunk_{chunk.chunk_index}"
+            chunk_name = f"{file_name}.part{chunk.chunk_index}"
             
             # Get chunk from storage
             response = storage_nodes[node_id].get_object(
-                Bucket="file-storage",
+                Bucket=settings.STORAGE_NODES[node_id]['bucket'],
                 Key=chunk_name
             )
             
@@ -272,14 +273,14 @@ def get_download_url(request, file_name):
                 # Try to repair from replica
                 for replica in chunks.filter(chunk_index=chunk.chunk_index).exclude(node_id=node_id):
                     response = storage_nodes[replica.node_id].get_object(
-                        Bucket="file-storage",
+                        Bucket=settings.STORAGE_NODES[replica.node_id]['bucket'],
                         Key=chunk_name
                     )
                     replica_data = response['Body'].read()
                     if hashlib.sha256(replica_data).hexdigest() == chunk.chunk_hash:
                         # Repair corrupted chunk
                         storage_nodes[node_id].put_object(
-                            Bucket="file-storage",
+                            Bucket=settings.STORAGE_NODES[node_id]['bucket'],
                             Key=chunk_name,
                             Body=replica_data
                         )
@@ -303,12 +304,12 @@ def remove_file(request, file_name):
         
         # Delete chunks from all nodes
         for chunk in chunks:
-            chunk_name = f"{file_metadata.file_hash}_chunk_{chunk.chunk_index}"
+            chunk_name = f"{file_name}.part{chunk.chunk_index}"
             node_id = chunk.node_id
             
             try:
                 storage_nodes[node_id].delete_object(
-                    Bucket="file-storage",
+                    Bucket=settings.STORAGE_NODES[node_id]['bucket'],
                     Key=chunk_name
                 )
                 
