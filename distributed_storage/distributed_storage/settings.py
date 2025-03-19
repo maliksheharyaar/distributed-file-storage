@@ -83,13 +83,13 @@ CORS_ALLOW_CREDENTIALS = True
 # MinIO Configuration
 STORAGE_NODES = {
     'node1': {
-        'endpoint_url': 'http://localhost:9010',
+        'endpoint_url': 'http://minio1:9000',
         'access_key': 'minioadmin',
         'secret_key': 'minioadmin',
         'bucket': 'file-storage'
     },
     'node2': {
-        'endpoint_url': 'http://localhost:9020',
+        'endpoint_url': 'http://minio2:9000',
         'access_key': 'minioadmin2',
         'secret_key': 'minioadmin2',
         'bucket': 'file-storage'
@@ -146,11 +146,11 @@ STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # MinIO Instance Configurations
-MINIO_INSTANCE_1_URL = "http://127.0.0.1:9000"
+MINIO_INSTANCE_1_URL = "http://minio:9000"
 MINIO_INSTANCE_1_ACCESS_KEY = "minioadmin"
 MINIO_INSTANCE_1_SECRET_KEY = "minioadmin"
 
-MINIO_INSTANCE_2_URL = "http://127.0.0.1:9001"
+MINIO_INSTANCE_2_URL = "http://minio:9000"
 MINIO_INSTANCE_2_ACCESS_KEY = "minioadmin"
 MINIO_INSTANCE_2_SECRET_KEY = "minioadmin"
 

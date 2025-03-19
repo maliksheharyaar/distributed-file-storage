@@ -1,6 +1,20 @@
 version: '3.8'
 
 services:
+  django:
+    image: django
+    build: .
+    command: python manage.py runserver 0.0.0.0:8000
+    environment:
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./distributed_storage:/app
+    depends_on:
+      - minio1
+      - minio2
+
   minio1:
     image: minio/minio
     ports:
@@ -37,4 +51,4 @@ services:
 
 volumes:
   minio1_data:
-  minio2_data: 
+  minio2_data:

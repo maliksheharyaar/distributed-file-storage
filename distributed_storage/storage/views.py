@@ -1,7 +1,8 @@
+import base64
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from django.shortcuts import render
-from django.views.decorators.csrf import csrf_protect
+from django.views.decorators.csrf import csrf_protect, csrf_exempt
 from django.http import JsonResponse
 from .models import FileMetadata, ChunkMetadata, NodeMetadata
 import boto3
@@ -12,6 +13,9 @@ from django.utils import timezone
 from concurrent.futures import ThreadPoolExecutor
 from botocore.exceptions import ClientError
 from django.urls import reverse
+from cryptography.fernet import Fernet, InvalidToken
+import zlib
+from django.http import HttpResponse
 
 CHUNK_SIZE = 5 * 1024 * 1024  # 5MB chunks
 REPLICATION_FACTOR = 2  # Number of copies to maintain
@@ -135,7 +139,7 @@ def create_chunks(file_content, filename, chunk_size=CHUNK_SIZE):
     return chunks
 
 # Save a file to the storage nodes
-@csrf_protect
+@csrf_exempt
 def save_file(request):
     if request.method != 'POST':
         return JsonResponse({'error': 'Invalid request'}, status=400)
@@ -143,10 +147,40 @@ def save_file(request):
     if 'file' not in request.FILES:
         return JsonResponse({'error': 'No file found'}, status=400)
 
+    # Check for optional parameters
+    encrypt = request.GET.get('encrypt', 'false').lower() == 'true'
+    compress = request.GET.get('compress', 'false').lower() == 'true'
+    password = request.GET.get('password', None)
+
+    # If encryption is requested, ensure a password is provided
+    if encrypt and not password:
+        return JsonResponse({'error': 'Password is required for encryption'}, status=400)
+
+    # Generate encryption key from the password if encryption is enabled
+    encryption_key = None
+    cipher = None
+    if encrypt:
+        encryption_key = hashlib.sha256(password.encode()).digest()
+        cipher = Fernet(base64.urlsafe_b64encode(encryption_key[:32]))
+
     uploaded_file = request.FILES['file']
     
     # Read the content once and store it in memory
     content = uploaded_file.read()
+    original_file_size = len(content)  # Store the original file size
+
+    # Compress the file if requested
+    if compress:
+        # Use maximum compression level (9)
+        content = zlib.compress(content, level=9)
+    
+    # Encrypt the file if requested
+    if encrypt:
+        try:
+            content = cipher.encrypt(content)
+        except InvalidToken:
+            return JsonResponse({'error': 'Encryption failed due to invalid token'}, status=500)
+
     file_hash = hashlib.sha256(content).hexdigest()
 
     # Check for duplicate file
@@ -158,8 +192,16 @@ def save_file(request):
             'url': existing_file.file_url
         })
 
-    # Get base filename without path
+    # Handle version control
     filename = uploaded_file.name.split('/')[-1]
+    existing_files_with_name = FileMetadata.objects.filter(filename__startswith=filename).order_by('-version')
+    if existing_files_with_name.exists():
+        latest_version = existing_files_with_name.first().version
+        version = latest_version + 1
+        filename = f"{filename}_v{version}"
+    else:
+        version = 1
+
     chunks = create_chunks(content, filename)
     target_nodes = get_least_loaded_nodes()
     
@@ -186,10 +228,14 @@ def save_file(request):
         # Store file metadata
         file_metadata = FileMetadata.objects.create(
             filename=filename,
-            file_size=len(content),
+            version=version,  # Save the version number
+            file_size=len(content),  # Compressed file size
+            original_file_size=original_file_size if compress else None,  # Store original size if compressed
             file_hash=file_hash,
             chunk_count=len(chunks),
-            file_url=file_url
+            file_url=file_url,
+            is_compressed=compress,  # Set compression flag
+            is_encrypted=encrypt     # Set encryption flag
         )
 
         # Store chunks with replication
@@ -234,13 +280,16 @@ def get_files(request):
         file_list = [{
             'name': f.filename,
             'size': format_size(f.file_size),
+            'original_size': format_size(f.original_file_size) if f.is_compressed else None,
             'url': f.file_url,
             'modified': f.created_at.strftime('%Y-%m-%d %H:%M'),
             'chunks': {
                 'count': f.chunk_count,
                 'size': format_size(CHUNK_SIZE),
                 'replicas': REPLICATION_FACTOR
-            }
+            },
+            'is_compressed': f.is_compressed,  # Include compression flag
+            'is_encrypted': f.is_encrypted    # Include encryption flag
         } for f in files]
 
         return Response({'files': file_list})
@@ -254,7 +303,8 @@ def get_download_url(request, file_name):
         file_metadata = FileMetadata.objects.get(filename=file_name)
         chunks = ChunkMetadata.objects.filter(file=file_metadata).order_by('chunk_index')
         
-        # Verify file integrity
+        # Verify file integrity and reconstruct the file
+        reconstructed_file = b""
         for chunk in chunks:
             node_id = chunk.node_id
             chunk_name = f"{file_name}.part{chunk.chunk_index}"
@@ -284,11 +334,38 @@ def get_download_url(request, file_name):
                             Key=chunk_name,
                             Body=replica_data
                         )
+                        chunk_data = replica_data
                         break
                 else:
                     return Response({'error': 'File corruption detected'}, status=500)
 
-        return Response({'url': file_metadata.file_url})
+            reconstructed_file += chunk_data
+
+        # Decrypt the file if it is encrypted
+        if file_metadata.is_encrypted:
+            password = request.GET.get('password', None)
+            if not password:
+                return Response({'error': 'Password is required for decryption'}, status=400)
+            
+            try:
+                encryption_key = hashlib.sha256(password.encode()).digest()
+                cipher = Fernet(base64.urlsafe_b64encode(encryption_key[:32]))
+                reconstructed_file = cipher.decrypt(reconstructed_file)
+            except InvalidToken:
+                return Response({'error': 'Decryption failed due to invalid password'}, status=400)
+
+        # Decompress the file if it is compressed
+        if file_metadata.is_compressed:
+            try:
+                reconstructed_file = zlib.decompress(reconstructed_file)
+            except zlib.error as e:
+                return Response({'error': f'Decompression failed: {str(e)}'}, status=500)
+
+        # Return the reconstructed file as a downloadable response
+        response = Response(reconstructed_file, content_type='application/octet-stream')
+        response['Content-Disposition'] = f'attachment; filename="{file_metadata.filename}"'
+        return response
+
     except FileMetadata.DoesNotExist:
         return Response({'error': 'File not found'}, status=404)
     except Exception as e:
@@ -428,6 +505,70 @@ def get_system_stats(request):
             'replication_factor': REPLICATION_FACTOR,
             'nodes': node_stats
         })
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+@api_view(['GET'])
+def download(request, file_name):
+    try:
+        # Fetch file metadata
+        file_metadata = FileMetadata.objects.get(filename=file_name)
+        chunks = ChunkMetadata.objects.filter(file=file_metadata).order_by('chunk_index')
+        seen_indices = set()
+        unique_chunks = []
+        for chunk in chunks:
+            if chunk.chunk_index not in seen_indices:
+                unique_chunks.append(chunk)
+            seen_indices.add(chunk.chunk_index)
+        chunks = unique_chunks
+        
+        # Reconstruct the file from chunks
+        reconstructed_file = b""
+        for chunk in chunks:
+            node_id = chunk.node_id
+            chunk_name = f"{file_name}.part{chunk.chunk_index}"
+            
+            # Retrieve the chunk from the storage node
+            response = storage_nodes[node_id].get_object(
+                Bucket=settings.STORAGE_NODES[node_id]['bucket'],
+                Key=chunk_name
+            )
+            chunk_data = response['Body'].read()
+            
+            # Verify chunk integrity
+            chunk_hash = hashlib.sha256(chunk_data).hexdigest()
+            if chunk_hash != chunk.chunk_hash:
+                return Response({'error': 'File integrity check failed'}, status=500)
+            
+            reconstructed_file += chunk_data
+
+        # Decrypt the file if it was encrypted
+        if file_metadata.is_encrypted:
+            password = request.GET.get('password', None)
+            if not password:
+                return Response({'error': 'Password is required for decryption'}, status=400)
+            
+            try:
+                encryption_key = hashlib.sha256(password.encode()).digest()
+                cipher = Fernet(base64.urlsafe_b64encode(encryption_key[:32]))
+                reconstructed_file = cipher.decrypt(reconstructed_file)
+            except InvalidToken:
+                return Response({'error': 'Decryption failed due to invalid password'}, status=400)
+
+        # Decompress the file if it was compressed
+        if file_metadata.is_compressed:
+            try:
+                reconstructed_file = zlib.decompress(reconstructed_file)
+            except zlib.error as e:
+                return Response({'error': f'Decompression failed: {str(e)}'}, status=500)
+
+        # Return the reconstructed file as a downloadable response
+        response = HttpResponse(reconstructed_file, content_type='application/octet-stream')
+        response['Content-Disposition'] = f'attachment; filename="{file_metadata.filename}"'
+        return response
+
+    except FileMetadata.DoesNotExist:
+        return Response({'error': 'File not found'}, status=404)
     except Exception as e:
         return Response({'error': str(e)}, status=500)
 

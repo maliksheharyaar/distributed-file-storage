@@ -29,6 +29,14 @@
         color: #92400e;
         border: 1px solid #fcd34d;
     }
+    .encrypted-icon {
+        color: #0369a1; /* Blue color */
+        font-size: 0.875rem; /* Slightly smaller than the text */
+    }
+    .compressed-icon {
+        color: #10b981; /* Green color */
+        font-size: 0.875rem; /* Slightly smaller than the text */
+    }
 </style>
 {% endblock %}
 
@@ -44,6 +52,25 @@
     
     <form id="uploadForm" class="space-y-4">
         <input type="file" id="fileInput" multiple class="block w-full">
+        
+        <!-- Encryption Option -->
+        <div class="flex items-center space-x-2">
+            <input type="checkbox" id="encryptCheckbox" class="form-checkbox">
+            <label for="encryptCheckbox" class="text-sm text-gray-600">Encrypt files</label>
+        </div>
+        
+        <!-- Password Field for Encryption -->
+        <div id="passwordField" class="hidden">
+            <label for="passwordInput" class="block text-sm text-gray-600">Encryption Password</label>
+            <input type="password" id="passwordInput" class="block w-full border rounded px-3 py-1">
+        </div>
+        
+        <!-- Compression Option -->
+        <div class="flex items-center space-x-2">
+            <input type="checkbox" id="compressCheckbox" class="form-checkbox">
+            <label for="compressCheckbox" class="text-sm text-gray-600">Compress files</label>
+        </div>
+        
         <div id="uploadProgress" class="hidden">
             <div class="flex justify-between text-sm text-gray-600 mb-1">
                 <span>Uploading: <span id="fileName"></span></span>
@@ -83,15 +110,34 @@
                     <tr class="border-t">
                         <td class="p-3">
                             {{ file.name }}
+                            {% if file.version > 1 %}
+                                <span class="text-gray-500">(v{{ file.version }})</span>
+                            {% endif %}
+                            {% if file.is_encrypted %}
+                                <span title="Encrypted" class="ml-2 encrypted-icon">
+                                    🔒
+                                </span>
+                            {% endif %}
+                            {% if file.is_compressed %}
+                                <span title="Compressed" class="ml-2 compressed-icon">
+                                    📦
+                                </span>
+                            {% endif %}
                             <div class="file-info">Modified: {{ file.modified }}</div>
                         </td>
-                        <td class="p-3">{{ file.size }}</td>
+                        <td class="p-3">
+                            <div>Size: {{ file.size }}</div>
+                            {% if file.is_compressed %}
+                                <div>Original: {{ file.original_size }}</div>
+                            {% endif %}
+                        </td>
                         <td class="p-3">
                             <div>{{ file.chunks.count }} chunks ({{ file.chunks.size }} each)</div>
                             <div class="file-info">{{ file.chunks.replicas }}x replication</div>
                         </td>
                         <td class="p-3">
-                            <a href="{{ file.url }}" class="text-blue-600 hover:underline mr-3">Download</a>
+                            <button onclick="downloadFile('{{ file.name }}', {{ file.is_encrypted|yesno:'true,false' }})" 
+                                    class="text-blue-600 hover:underline mr-3">Download</button>
                             <button onclick="deleteFile('{{ file.name }}')" 
                                     class="text-red-600 hover:underline">Delete</button>
                         </td>
@@ -149,15 +195,22 @@
             <tr class="border-t">
                 <td class="p-3">
                     ${file.name}
+                    ${file.version > 1 ? `<span class="text-gray-500">(v${file.version})</span>` : ''}
+                    ${file.is_encrypted ? '<span title="Encrypted" class="ml-2 encrypted-icon">🔒</span>' : ''}
+                    ${file.is_compressed ? '<span title="Compressed" class="ml-2 compressed-icon">📦</span>' : ''}
                     <div class="file-info">Modified: ${file.modified}</div>
                 </td>
-                <td class="p-3">${file.size}</td>
+                <td class="p-3">
+                    <div>Size: ${file.size}</div>
+                    ${file.is_compressed ? `<div>Original: ${file.original_size}</div>` : ''}
+                </td>
                 <td class="p-3">
                     <div>${file.chunks.count} chunks (${file.chunks.size} each)</div>
                     <div class="file-info">${file.chunks.replicas}x replication</div>
                 </td>
                 <td class="p-3">
-                    <a href="${file.url}" class="text-blue-600 hover:underline mr-3">Download</a>
+                    <button onclick="downloadFile('${file.name}', ${file.is_encrypted ? 'true' : 'false'})" 
+                            class="text-blue-600 hover:underline mr-3">Download</button>
                     <button onclick="deleteFile('${file.name}')" 
                             class="text-red-600 hover:underline">Delete</button>
                 </td>
@@ -184,11 +237,30 @@
         percentText.textContent = `${percent}%`;
     }
 
+    // Show/hide password field based on encryption checkbox
+    document.getElementById('encryptCheckbox').addEventListener('change', (e) => {
+        const passwordField = document.getElementById('passwordField');
+        if (e.target.checked) {
+            passwordField.classList.remove('hidden');
+        } else {
+            passwordField.classList.add('hidden');
+        }
+    });
+
     // File upload handling
     document.getElementById('uploadForm').addEventListener('submit', async (e) => {
         e.preventDefault();
         const files = document.getElementById('fileInput').files;
         if (!files.length) return;
+
+        const encrypt = document.getElementById('encryptCheckbox').checked;
+        const compress = document.getElementById('compressCheckbox').checked;
+        const password = document.getElementById('passwordInput').value;
+
+        if (encrypt && !password) {
+            showAlert('Please provide a password for encryption.', 'warning');
+            return;
+        }
 
         const progress = document.getElementById('uploadProgress');
         const fileName = document.getElementById('fileName');
@@ -212,7 +284,13 @@
             }, 300);
 
             try {
-                const response = await fetch(CONFIG.endpoints.upload, {
+                const queryParams = new URLSearchParams({
+                    encrypt: encrypt,
+                    compress: compress,
+                    password: password
+                });
+
+                const response = await fetch(`${CONFIG.endpoints.upload}?${queryParams.toString()}`, {
                     method: 'POST',
                     headers: {
                         'X-CSRFToken': getCsrf()
@@ -264,6 +342,44 @@
             loadFiles();
         } catch (error) {
             alert('Delete failed: ' + error.message);
+        }
+    }
+
+    async function downloadFile(fileName, isEncrypted) {
+        let password = null;
+
+        if (isEncrypted) {
+            password = prompt('This file is encrypted. Please enter the password:');
+            if (!password) {
+                alert('Password is required to download this file.');
+                return;
+            }
+        }
+
+        try {
+            const queryParams = isEncrypted ? `?password=${encodeURIComponent(password)}` : '';
+            const response = await fetch(`/storage/download/${encodeURIComponent(fileName)}/${queryParams}`, {
+                method: 'GET',
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                alert(`Download failed: ${error.error}`);
+                return;
+            }
+
+            // Create a blob and trigger download
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            window.URL.revokeObjectURL(url);
+        } catch (error) {
+            alert(`Download failed: ${error.message}`);
         }
     }
 

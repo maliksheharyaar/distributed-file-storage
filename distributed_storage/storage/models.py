@@ -4,11 +4,15 @@ from django.utils import timezone
 # FileMetadata model to store metadata about each file
 class FileMetadata(models.Model):
     filename = models.CharField(max_length=255)
-    file_size = models.BigIntegerField()
+    version = models.IntegerField(default=1)  # New field for version control
+    file_size = models.BigIntegerField()  # Compressed file size
+    original_file_size = models.BigIntegerField(null=True, blank=True)  # Original file size
     file_hash = models.CharField(max_length=64)
+    chunk_count = models.IntegerField()
     file_url = models.URLField()
-    chunk_count = models.IntegerField(default=1)
-    created_at = models.DateTimeField(default=timezone.now)
+    is_compressed = models.BooleanField(default=False)
+    is_encrypted = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
